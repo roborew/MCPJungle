@@ -10,6 +10,7 @@ import (
 	"github.com/mcpjungle/mcpjungle/internal/telemetry"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/datatypes"
 )
 
 func lazyTestService(t *testing.T) *MCPService {
@@ -57,15 +58,67 @@ func lazyResultJSON(t *testing.T, result *mcp.CallToolResult, destination any) {
 	require.NoError(t, json.Unmarshal([]byte(text.Text), destination))
 }
 
+// TestLazyProxyServer_RegistersExactlyTwoMetaTools pins the public surface
+// of the lazy proxy: an agent must only see `mcpjungle__list_servers` and
+// `mcpjungle__show_server_tools`. The old `mcpjungle__list_tools` and
+// `mcpjungle__invoke` meta-tools must not leak through.
 func TestLazyProxyServer_RegistersExactlyTwoMetaTools(t *testing.T) {
 	service := lazyTestService(t)
 	tools := service.LazyMcpProxyServer().ListTools()
 	assert.Len(t, tools, 2)
-	assert.Contains(t, tools, metaToolListTools)
-	assert.Contains(t, tools, metaToolInvoke)
+	assert.Contains(t, tools, metaToolListServers)
+	assert.Contains(t, tools, metaToolShowServerTools)
 }
 
-func TestLazyDiscovery_ListAllReturnsEveryEnabledTool(t *testing.T) {
+// TestLazyDiscovery_ListServersReturnsEveryEnabledServer verifies the happy
+// path: in dev mode every enabled server is listed with its name,
+// description, transport, and the count of enabled tools.
+func TestLazyDiscovery_ListServersReturnsEveryEnabledServer(t *testing.T) {
+	service := lazyTestService(t)
+	alpha := createLazyTestServer(t, service, "alpha")
+	beta := createLazyTestServer(t, service, "beta")
+	disabled := createLazyTestServer(t, service, "gamma")
+	require.NoError(t, service.db.Model(disabled).Update("enabled", false).Error)
+
+	createLazyTestTool(t, service, alpha, "search", true)
+	createLazyTestTool(t, service, alpha, "disabled", false)
+	createLazyTestTool(t, service, beta, "lookup", true)
+
+	ctx := context.WithValue(context.Background(), "mode", model.ModeDev)
+	result, err := service.lazyListServersHandler(ctx, lazyRequest(metaToolListServers, nil))
+	require.NoError(t, err)
+
+	var entries []map[string]any
+	lazyResultJSON(t, result, &entries)
+	require.Len(t, entries, 2, "disabled server must be filtered out")
+
+	assert.Equal(t, []string{"alpha", "beta"}, []string{entries[0]["name"].(string), entries[1]["name"].(string)})
+	assert.Equal(t, "alpha description", entries[0]["description"])
+	assert.Equal(t, "beta description", entries[1]["description"])
+	assert.Equal(t, "stdio", entries[0]["transport"])
+	assert.Equal(t, "stdio", entries[1]["transport"])
+
+	assert.EqualValues(t, 1, entries[0]["enabled_tool_count"], "disabled tool must not be counted")
+	assert.EqualValues(t, 1, entries[1]["enabled_tool_count"])
+}
+
+// TestLazyDiscovery_ShowServerToolsRequiresServerArg guarantees we cannot
+// accidentally regress to the old behaviour of dumping every registered tool.
+// Without `server` the handler must reject the call.
+func TestLazyDiscovery_ShowServerToolsRequiresServerArg(t *testing.T) {
+	service := lazyTestService(t)
+	createLazyTestServer(t, service, "alpha")
+	ctx := context.WithValue(context.Background(), "mode", model.ModeDev)
+
+	result, err := service.lazyShowServerToolsHandler(ctx, lazyRequest(metaToolShowServerTools, nil))
+	require.NoError(t, err)
+	require.True(t, result.IsError, "missing server arg must produce an error result")
+}
+
+// TestLazyDiscovery_ShowServerToolsReturnsOnlyRequestedServer confirms the
+// scoped lookup returns the canonical tool list for one server and ignores
+// others, plus honours the tool's enabled flag.
+func TestLazyDiscovery_ShowServerToolsReturnsOnlyRequestedServer(t *testing.T) {
 	service := lazyTestService(t)
 	alpha := createLazyTestServer(t, service, "alpha")
 	beta := createLazyTestServer(t, service, "beta")
@@ -74,47 +127,78 @@ func TestLazyDiscovery_ListAllReturnsEveryEnabledTool(t *testing.T) {
 	createLazyTestTool(t, service, beta, "lookup", true)
 	ctx := context.WithValue(context.Background(), "mode", model.ModeDev)
 
-	// No args: list every enabled tool across every server.
-	all, err := service.lazyListToolsHandler(ctx, lazyRequest(metaToolListTools, nil))
+	result, err := service.lazyShowServerToolsHandler(ctx, lazyRequest(metaToolShowServerTools, map[string]any{"server": "alpha"}))
 	require.NoError(t, err)
-	var allTools []map[string]any
-	lazyResultJSON(t, all, &allTools)
-	names := make([]string, 0, len(allTools))
-	for _, t := range allTools {
-		names = append(names, t["name"].(string))
-	}
-	assert.ElementsMatch(t, []string{"alpha__search", "beta__lookup"}, names)
-	for _, tool := range allTools {
-		assert.NotEmpty(t, tool["input_schema"])
-		assert.NotEmpty(t, tool["description"])
-	}
+	var tools []map[string]any
+	lazyResultJSON(t, result, &tools)
 
-	// With server filter: only that server's enabled tools.
-	filtered, err := service.lazyListToolsHandler(ctx, lazyRequest(metaToolListTools, map[string]any{"server": "alpha"}))
-	require.NoError(t, err)
-	var filteredTools []map[string]any
-	lazyResultJSON(t, filtered, &filteredTools)
-	require.Len(t, filteredTools, 1)
-	assert.Equal(t, "alpha__search", filteredTools[0]["name"])
+	require.Len(t, tools, 1, "only alpha__search must be returned; beta must not leak")
+	assert.Equal(t, "alpha__search", tools[0]["name"])
+	assert.NotEmpty(t, tools[0]["input_schema"])
+	assert.NotEmpty(t, tools[0]["description"])
 }
 
-func TestLazyDiscovery_InvokeRoutesToCanonicalTool(t *testing.T) {
+// TestLazyDiscovery_ShowServerToolsUnknownServerReturnsError covers the case
+// where the requested server does not exist at all.
+func TestLazyDiscovery_ShowServerToolsUnknownServerReturnsError(t *testing.T) {
 	service := lazyTestService(t)
-	serverModel := createLazyTestServer(t, service, "alpha")
-	createLazyTestTool(t, service, serverModel, "search", true)
 	ctx := context.WithValue(context.Background(), "mode", model.ModeDev)
 
-	// Authorization + tool lookup happens before InvokeTool, but the tool is
-	// stdio-backed ("echo") and we haven't stubbed a session, so we expect a
-	// non-nil invocation path that surfaces the upstream connection error.
-	result, err := service.lazyInvokeHandler(ctx, lazyRequest(metaToolInvoke, map[string]any{
-		"server": "alpha",
-		"tool":   "search",
-		"args":   map[string]any{},
-	}))
+	result, err := service.lazyShowServerToolsHandler(ctx, lazyRequest(metaToolShowServerTools, map[string]any{"server": "missing"}))
 	require.NoError(t, err)
-	require.NotNil(t, result)
-	// We are not asserting IsError=true because an in-process session may be
-	// created in some test builds; we only need the handler to dispatch.
-	_ = result
+	require.True(t, result.IsError)
+}
+
+// TestLazyDiscovery_ListServersEnterpriseAllowList proves the handler honours
+// the enterprise client allow list: an unlisted server must not be returned.
+func TestLazyDiscovery_ListServersEnterpriseAllowList(t *testing.T) {
+	service := lazyTestService(t)
+	alpha := createLazyTestServer(t, service, "alpha")
+	beta := createLazyTestServer(t, service, "beta")
+	createLazyTestTool(t, service, alpha, "search", true)
+	createLazyTestTool(t, service, beta, "lookup", true)
+
+	client := &model.McpClient{
+		Name:      "restricted-client",
+		AllowList: datatypes.JSON(`["alpha"]`),
+	}
+	ctx := context.WithValue(context.Background(), "mode", model.ModeEnterprise)
+	ctx = context.WithValue(ctx, "client", client)
+
+	result, err := service.lazyListServersHandler(ctx, lazyRequest(metaToolListServers, nil))
+	require.NoError(t, err)
+	var entries []map[string]any
+	lazyResultJSON(t, result, &entries)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "alpha", entries[0]["name"])
+}
+
+// TestLazyDiscovery_ShowServerToolsEnterpriseAllowList mirrors the list
+// check for the per-server lookup.
+func TestLazyDiscovery_ShowServerToolsEnterpriseAllowList(t *testing.T) {
+	service := lazyTestService(t)
+	alpha := createLazyTestServer(t, service, "alpha")
+	beta := createLazyTestServer(t, service, "beta")
+	createLazyTestTool(t, service, alpha, "search", true)
+	createLazyTestTool(t, service, beta, "lookup", true)
+
+	client := &model.McpClient{
+		Name:      "restricted-client",
+		AllowList: datatypes.JSON(`["beta"]`),
+	}
+	ctx := context.WithValue(context.Background(), "mode", model.ModeEnterprise)
+	ctx = context.WithValue(ctx, "client", client)
+
+	// alpha is denied
+	denied, err := service.lazyShowServerToolsHandler(ctx, lazyRequest(metaToolShowServerTools, map[string]any{"server": "alpha"}))
+	require.NoError(t, err)
+	require.True(t, denied.IsError)
+
+	// beta is allowed
+	allowed, err := service.lazyShowServerToolsHandler(ctx, lazyRequest(metaToolShowServerTools, map[string]any{"server": "beta"}))
+	require.NoError(t, err)
+	var tools []map[string]any
+	lazyResultJSON(t, allowed, &tools)
+	require.Len(t, tools, 1)
+	assert.Equal(t, "beta__lookup", tools[0]["name"])
 }
