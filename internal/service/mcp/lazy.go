@@ -13,10 +13,8 @@ import (
 )
 
 const (
-	metaToolInvoke      = "mcpjungle__invoke"
-	metaToolDescribe    = "mcpjungle__describe"
-	metaToolListServers = "mcpjungle__list_servers"
-	metaToolListTools   = "mcpjungle__list_tools"
+	metaToolInvoke    = "mcpjungle__invoke"
+	metaToolListTools = "mcpjungle__list_tools"
 )
 
 type lazyContextKey string
@@ -47,96 +45,108 @@ func newLazyMCPServer() *server.MCPServer {
 }
 
 // initializeLazyHandlers registers the fixed lazy tool set once at startup.
+//
+// The lazy proxy exposes exactly two meta-tools so an agent has a clear,
+// two-step workflow:
+//
+//  1. Call `mcpjungle__list_tools` to discover every enabled tool across
+//     every registered MCP server (no upstream connection is opened).
+//     Pass an optional `server` argument to restrict the listing to a single
+//     server.
+//  2. Call `mcpjungle__invoke` with the chosen `server` and `tool` (the same
+//     `server__tool` form returned by list_tools) to actually execute the
+//     tool. This is the only operation that initializes an upstream server.
 func (m *MCPService) initializeLazyHandlers() {
 	m.lazyMcpProxyServer.AddTool(mcp.NewTool(
-		metaToolListServers,
-		mcp.WithDescription("List enabled MCP servers available to this client without initializing upstream servers."),
-	), m.lazyListServersHandler)
-	m.lazyMcpProxyServer.AddTool(mcp.NewTool(
 		metaToolListTools,
-		mcp.WithDescription("List enabled tools and input schemas for one available MCP server without initializing it."),
-		mcp.WithString("server", mcp.Required()),
+		mcp.WithDescription(
+			"REQUIRED FIRST STEP. You MUST call `mcpjungle__list_tools` before calling "+
+				"`mcpjungle__invoke`. This is the only way to find the exact server and tool names "+
+				"available to you; do not guess them. "+
+				"Returns every enabled tool across every registered MCP server, each with its "+
+				"canonical `server__tool` name, description, and input schema. "+
+				"Pass an optional `server` argument to restrict the listing to a single MCP server. "+
+				"This call does NOT initialize any upstream server and is cheap to repeat.",
+		),
+		mcp.WithString("server",
+			mcp.Description("Optional. Restrict the listing to a single MCP server name."),
+		),
 	), m.lazyListToolsHandler)
 	m.lazyMcpProxyServer.AddTool(mcp.NewTool(
-		metaToolDescribe,
-		mcp.WithDescription("Return an enabled MCP tool's schema without initializing its upstream server."),
-		mcp.WithString("server", mcp.Required()),
-		mcp.WithString("tool", mcp.Required()),
-	), m.lazyDescribeHandler)
-	m.lazyMcpProxyServer.AddTool(mcp.NewTool(
 		metaToolInvoke,
-		mcp.WithDescription("Invoke an enabled MCP tool. Only this operation initializes an upstream server."),
-		mcp.WithString("server", mcp.Required()),
-		mcp.WithString("tool", mcp.Required()),
-		mcp.WithObject("args", mcp.AdditionalProperties(true)),
+		mcp.WithDescription(
+			"Execute a tool on a registered MCP server. This is the ONLY operation that opens "+
+				"a connection to an upstream server. "+
+				"DO NOT call this tool until you have first called `mcpjungle__list_tools` to "+
+				"discover the exact `server` and `tool` names. Never invent, abbreviate, or guess "+
+				"server or tool names — the names returned by list_tools are the only valid values. "+
+				"Use the canonical `server__tool` form from list_tools; pass the bare tool name "+
+				"alongside its `server`.",
+		),
+		mcp.WithString("server", mcp.Required(),
+			mcp.Description("MCP server name copied verbatim from a `mcpjungle__list_tools` result (the part before `__` in the canonical tool name). Must not be guessed."),
+		),
+		mcp.WithString("tool", mcp.Required(),
+			mcp.Description("Tool name copied verbatim from a `mcpjungle__list_tools` result (the part after `__` in the canonical tool name). Must not be guessed."),
+		),
+		mcp.WithObject("args",
+			mcp.Description("Arguments matching the upstream tool's input schema."),
+			mcp.AdditionalProperties(true),
+		),
 	), m.lazyInvokeHandler)
 }
 
-func (m *MCPService) lazyListServersHandler(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	servers, err := m.ListMcpServers()
-	if err != nil {
-		return mcp.NewToolResultErrorf("failed to list MCP servers: %v", err), nil
-	}
-	allowed, err := m.lazyAllowedTools(ctx)
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-	serverNames := make(map[string]bool)
-	for name := range allowed {
-		serverName, _, _ := splitServerToolName(name)
-		serverNames[serverName] = true
-	}
-	result := make([]map[string]string, 0, len(servers))
-	for _, serverModel := range servers {
-		if !serverModel.Enabled || !serverNames[serverModel.Name] || authorizeProxyServerAccess(ctx, serverModel.Name) != nil {
-			continue
-		}
-		result = append(result, map[string]string{"name": serverModel.Name, "description": serverModel.Description})
-	}
-	sort.Slice(result, func(i, j int) bool { return result[i]["name"] < result[j]["name"] })
-	return lazyJSONResult(result)
-}
-
+// lazyListToolsHandler returns the enabled tools the caller can invoke.
+//
+// With no `server` argument it returns every enabled tool across every
+// registered MCP server (the canonical "directory" call). With `server=<name>`
+// it restricts the listing to that single server. The handler never opens a
+// connection to any upstream MCP server, so it is cheap to call repeatedly.
 func (m *MCPService) lazyListToolsHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	serverName := req.GetString("server", "")
-	if serverName == "" {
-		return mcp.NewToolResultError("`server` is required"), nil
-	}
-	if err := m.authorizeLazyServer(ctx, serverName); err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-	tools, err := m.ListToolsByServer(serverName)
-	if err != nil {
-		return mcp.NewToolResultErrorf("failed to list tools for %s: %v", serverName, err), nil
-	}
+
 	allowed, err := m.lazyAllowedTools(ctx)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+
+	var tools []model.Tool
+	switch {
+	case serverName != "":
+		if err := m.authorizeLazyServer(ctx, serverName); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		tools, err = m.ListToolsByServer(serverName)
+		if err != nil {
+			return mcp.NewToolResultErrorf("failed to list tools for %s: %v", serverName, err), nil
+		}
+	default:
+		tools, err = m.ListTools()
+		if err != nil {
+			return mcp.NewToolResultErrorf("failed to list tools: %v", err), nil
+		}
+	}
+
 	result := make([]map[string]any, 0, len(tools))
 	for _, tool := range tools {
-		if tool.Enabled && allowed[tool.Name] {
-			result = append(result, lazyToolMetadata(tool))
+		if !tool.Enabled || !allowed[tool.Name] {
+			continue
 		}
+		// When listing globally, also drop tools whose parent server is not
+		// accessible in the current auth/group context.
+		if serverName == "" {
+			if _, _, ok := splitServerToolName(tool.Name); !ok {
+				continue
+			}
+			parent, _, _ := splitServerToolName(tool.Name)
+			if authorizeProxyServerAccess(ctx, parent) != nil {
+				continue
+			}
+		}
+		result = append(result, lazyToolMetadata(tool))
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i]["name"].(string) < result[j]["name"].(string) })
 	return lazyJSONResult(result)
-}
-
-func (m *MCPService) lazyDescribeHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	serverName, toolName := req.GetString("server", ""), req.GetString("tool", "")
-	if serverName == "" || toolName == "" {
-		return mcp.NewToolResultError("`server` and `tool` are required"), nil
-	}
-	canonical := mergeServerToolNames(serverName, toolName)
-	if err := m.authorizeLazyTool(ctx, serverName, canonical); err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-	tool, err := m.GetTool(canonical)
-	if err != nil || !tool.Enabled {
-		return mcp.NewToolResultErrorf("tool %s is unavailable", canonical), nil
-	}
-	return lazyJSONResult(lazyToolMetadata(*tool))
 }
 
 func (m *MCPService) lazyInvokeHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {

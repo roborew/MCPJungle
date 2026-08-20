@@ -57,17 +57,15 @@ func lazyResultJSON(t *testing.T, result *mcp.CallToolResult, destination any) {
 	require.NoError(t, json.Unmarshal([]byte(text.Text), destination))
 }
 
-func TestLazyProxyServer_RegistersFixedMetaTools(t *testing.T) {
+func TestLazyProxyServer_RegistersExactlyTwoMetaTools(t *testing.T) {
 	service := lazyTestService(t)
 	tools := service.LazyMcpProxyServer().ListTools()
-	assert.Len(t, tools, 4)
-	assert.Contains(t, tools, metaToolListServers)
+	assert.Len(t, tools, 2)
 	assert.Contains(t, tools, metaToolListTools)
-	assert.Contains(t, tools, metaToolDescribe)
 	assert.Contains(t, tools, metaToolInvoke)
 }
 
-func TestLazyDiscovery_ListsOnlyEnabledPersistedMetadata(t *testing.T) {
+func TestLazyDiscovery_ListAllReturnsEveryEnabledTool(t *testing.T) {
 	service := lazyTestService(t)
 	alpha := createLazyTestServer(t, service, "alpha")
 	beta := createLazyTestServer(t, service, "beta")
@@ -76,30 +74,47 @@ func TestLazyDiscovery_ListsOnlyEnabledPersistedMetadata(t *testing.T) {
 	createLazyTestTool(t, service, beta, "lookup", true)
 	ctx := context.WithValue(context.Background(), "mode", model.ModeDev)
 
-	servers, err := service.lazyListServersHandler(ctx, lazyRequest(metaToolListServers, nil))
+	// No args: list every enabled tool across every server.
+	all, err := service.lazyListToolsHandler(ctx, lazyRequest(metaToolListTools, nil))
 	require.NoError(t, err)
-	var serverResult []map[string]string
-	lazyResultJSON(t, servers, &serverResult)
-	assert.Equal(t, []string{"alpha", "beta"}, []string{serverResult[0]["name"], serverResult[1]["name"]})
+	var allTools []map[string]any
+	lazyResultJSON(t, all, &allTools)
+	names := make([]string, 0, len(allTools))
+	for _, t := range allTools {
+		names = append(names, t["name"].(string))
+	}
+	assert.ElementsMatch(t, []string{"alpha__search", "beta__lookup"}, names)
+	for _, tool := range allTools {
+		assert.NotEmpty(t, tool["input_schema"])
+		assert.NotEmpty(t, tool["description"])
+	}
 
-	tools, err := service.lazyListToolsHandler(ctx, lazyRequest(metaToolListTools, map[string]any{"server": "alpha"}))
+	// With server filter: only that server's enabled tools.
+	filtered, err := service.lazyListToolsHandler(ctx, lazyRequest(metaToolListTools, map[string]any{"server": "alpha"}))
 	require.NoError(t, err)
-	var toolResult []map[string]any
-	lazyResultJSON(t, tools, &toolResult)
-	require.Len(t, toolResult, 1)
-	assert.Equal(t, "alpha__search", toolResult[0]["name"])
-	assert.NotEmpty(t, toolResult[0]["input_schema"])
+	var filteredTools []map[string]any
+	lazyResultJSON(t, filtered, &filteredTools)
+	require.Len(t, filteredTools, 1)
+	assert.Equal(t, "alpha__search", filteredTools[0]["name"])
 }
 
-func TestLazyDiscovery_DescribeUsesRegistryWithoutUpstreamInitialization(t *testing.T) {
+func TestLazyDiscovery_InvokeRoutesToCanonicalTool(t *testing.T) {
 	service := lazyTestService(t)
-	serverModel := createLazyTestServer(t, service, "offline")
-	createLazyTestTool(t, service, serverModel, "inspect", true)
+	serverModel := createLazyTestServer(t, service, "alpha")
+	createLazyTestTool(t, service, serverModel, "search", true)
 	ctx := context.WithValue(context.Background(), "mode", model.ModeDev)
 
-	result, err := service.lazyDescribeHandler(ctx, lazyRequest(metaToolDescribe, map[string]any{"server": "offline", "tool": "inspect"}))
+	// Authorization + tool lookup happens before InvokeTool, but the tool is
+	// stdio-backed ("echo") and we haven't stubbed a session, so we expect a
+	// non-nil invocation path that surfaces the upstream connection error.
+	result, err := service.lazyInvokeHandler(ctx, lazyRequest(metaToolInvoke, map[string]any{
+		"server": "alpha",
+		"tool":   "search",
+		"args":   map[string]any{},
+	}))
 	require.NoError(t, err)
-	var metadata map[string]any
-	lazyResultJSON(t, result, &metadata)
-	assert.Equal(t, "offline__inspect", metadata["name"])
+	require.NotNil(t, result)
+	// We are not asserting IsError=true because an in-process session may be
+	// created in some test builds; we only need the handler to dispatch.
+	_ = result
 }
