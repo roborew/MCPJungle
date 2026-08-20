@@ -151,15 +151,15 @@ mcpjungle enable prompt context7
 For agents that would be overwhelmed by a full tool listing, the gateway also exposes a **lazy discovery** variant at `/mcp?mode=lazy` and `/v0/groups/{name}/mcp?mode=lazy`. Instead of registering every enabled tool, it registers exactly two meta-tools:
 
 - `mcpjungle__list_servers` — returns one entry per enabled MCP server the caller is allowed to see, with the server name, description, transport, and the count of enabled tools it provides.
-- `mcpjungle__show_server_tools` — requires the `server` argument. Returns the canonical `<server-name>__<tool-name>` list for that single server, including descriptions and input schemas.
+- `mcpjungle__show_server_tools` — requires the `server` argument. It activates that server's enabled canonical `<server-name>__<tool-name>` tools in the current MCP session, sends `notifications/tools/list_changed`, and returns their descriptions and input schemas as confirmation.
 
-There is no `mcpjungle__invoke` meta-tool. Once the agent has the canonical name and schema, it invokes the upstream tool directly through the same proxy.
+There is no `mcpjungle__invoke` meta-tool. Once the client processes the tool-list change, it invokes the activated canonical tool directly through the same proxy. Other servers' tool schemas stay outside that session until selected.
 
 The recommended workflow is:
 
 1. Call `mcpjungle__list_servers` to see which servers are available.
-2. Pick a server and call `mcpjungle__show_server_tools` with `server=<name>` to fetch its tools.
-3. Invoke the upstream tool by its canonical name (`<server>__<tool>`).
+2. Pick a server and call `mcpjungle__show_server_tools` with `server=<name>` to activate its tools for the current session.
+3. Process `notifications/tools/list_changed`, then invoke the activated upstream tool by its canonical name (`<server>__<tool>`).
 
 In **enterprise** mode, both meta-tools honour the client's server allow list, so an unauthorized server never appears in `mcpjungle__list_servers` and `mcpjungle__show_server_tools` rejects it with an error.
 

@@ -35,8 +35,8 @@ type MCPService struct {
 	mcpProxyServer    *server.MCPServer
 	sseMcpProxyServer *server.MCPServer
 
-	// lazyMcpProxyServer exposes a fixed set of metadata and invocation tools to
-	// clients using /mcp?mode=lazy. Its registry is immutable after startup.
+	// lazyMcpProxyServer exposes fixed discovery tools to clients using
+	// /mcp?mode=lazy and adds selected upstream tools to individual sessions.
 	lazyMcpProxyServer *server.MCPServer
 	toolGroupService   ToolGroupResolver
 
@@ -109,7 +109,7 @@ func NewMCPService(c *ServiceConfig) (*MCPService, error) {
 	return s, nil
 }
 
-// LazyMcpProxyServer returns the immutable lazy-mode MCP server.
+// LazyMcpProxyServer returns the lazy-mode MCP server.
 func (m *MCPService) LazyMcpProxyServer() *server.MCPServer {
 	return m.lazyMcpProxyServer
 }
